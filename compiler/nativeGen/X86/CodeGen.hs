@@ -47,6 +47,7 @@ import CmmUtils
 import Cmm
 import Hoopl
 import CLabel
+import SMRep
 
 -- The rest:
 import ForeignCall      ( CCallConv(..) )
@@ -1761,7 +1762,7 @@ genCCall dflags is32Bit (PrimTarget (MO_PopCnt width)) dest_regs@[dst]
                           CallReference lbl
             let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                                            [NoHint] [NoHint]
-                                                           CmmMayReturn)
+                                                           CmmMayReturn Nothing)
             genCCall dflags is32Bit target dest_regs args
   where
     size = intSize width
@@ -1773,7 +1774,7 @@ genCCall dflags is32Bit (PrimTarget (MO_Clz width)) dest_regs@[dst] args@[src]
     targetExpr <- cmmMakeDynamicReference dflags CallReference lbl
     let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                            [NoHint] [NoHint]
-                                           CmmMayReturn)
+                                           CmmMayReturn Nothing)
     genCCall dflags is32Bit target dest_regs args
 
   | otherwise = do
@@ -1805,7 +1806,7 @@ genCCall dflags is32Bit (PrimTarget (MO_Ctz width)) dest_regs@[dst] args@[src]
     targetExpr <- cmmMakeDynamicReference dflags CallReference lbl
     let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                            [NoHint] [NoHint]
-                                           CmmMayReturn)
+                                           CmmMayReturn Nothing)
     genCCall dflags is32Bit target dest_regs args
 
   | otherwise = do
@@ -1835,7 +1836,7 @@ genCCall dflags is32Bit (PrimTarget (MO_UF_Conv width)) dest_regs args = do
                   CallReference lbl
     let target = ForeignTarget targetExpr (ForeignConvention CCallConv
                                            [NoHint] [NoHint]
-                                           CmmMayReturn)
+                                           CmmMayReturn Nothing)
     genCCall dflags is32Bit target dest_regs args
   where
     lbl = mkCmmCodeLabel primPackageKey (fsLit (word2FloatLabel width))
@@ -2113,7 +2114,7 @@ genCCall32' dflags target dest_regs args = do
               -- We have to pop any stack padding we added
               -- even if we are doing stdcall, though (#5052)
             pop_size
-               | ForeignConvention StdCallConv _ _ _ <- cconv = arg_pad_size
+               | ForeignConvention StdCallConv _ _ _ _ <- cconv = arg_pad_size
                | otherwise = tot_arg_size
 
             call = callinsns `appOL`
@@ -2213,24 +2214,284 @@ genCCall32' dflags target dest_regs args = do
              arg_ty = cmmExprType dflags arg
              size = arg_size arg_ty -- Byte size
 
+-- | C type alignment in bytes
+cTypeAlignment :: CTypeInfo -> ByteOff
+cTypeAlignment (CPrimType t) =  widthInBytes (typeWidth t)
+cTypeAlignment (CStruct ts) = maximum $ map cTypeAlignment ts
+
+-- | C type padding in bytes
+cTypePadding :: CTypeInfo -> ByteOff -> ByteOff
+cTypePadding t pos = (al - (pos `mod` al)) `mod` al
+  where al = cTypeAlignment t
+
+-- | C type size in bytes including all necessary paddings
+cTypeSize :: CTypeInfo -> ByteOff
+cTypeSize (CPrimType t) = widthInBytes $ typeWidth t
+cTypeSize ti@(CStruct ts) = totalSize + padding
+  where
+  step total t =
+    let sz = cTypeSize t
+        pad = cTypePadding t total
+    in total + sz + pad
+  totalSize = foldl step 0 ts
+  padding = cTypePadding ti totalSize
+
+-- | Abi class specifies how to pass particular argument
+-- See amd64 ABI spec, 3.2.3 Parameter Passing
+data CAbiClass64
+  = CAbiNoClass  -- ^ unknow, initial value in algorithm
+  | CAbiInteger  -- ^ pass in regular register
+  | CAbiSSE      -- ^ pass in sse register
+  | CAbiMemory   -- ^ pass in memory, currently not used
+  deriving (Eq, Show)
+
+-- | Determine abi class for primitive types
+cTypeAbiClass64 :: CmmType -> CAbiClass64
+cTypeAbiClass64 t
+  | cmmEqType t b8  = CAbiInteger
+  | cmmEqType t b16 = CAbiInteger
+  | cmmEqType t b32 = CAbiInteger
+  | cmmEqType t b64 = CAbiInteger
+  | cmmEqType t f32 = CAbiSSE
+  | cmmEqType t f64 = CAbiSSE
+  | otherwise = pprPanic "cTypeAbiClass: unexpected (unsupported) type" (ppr t)
+
+-- | Caclulate abi class for structure
+mergeCAbiClasses64 :: CAbiClass64 -> CAbiClass64 -> CAbiClass64
+mergeCAbiClasses64 a b | a == b = a
+mergeCAbiClasses64 CAbiNoClass b = b
+mergeCAbiClasses64 a CAbiNoClass = a
+mergeCAbiClasses64 a b | a == CAbiMemory || b == CAbiMemory = CAbiMemory
+mergeCAbiClasses64 a b | a == CAbiInteger || b == CAbiInteger = CAbiInteger
+mergeCAbiClasses64 _ _ = CAbiSSE
+
+-- | Assign return value of foreign call to destination registers
+--
+-- See Note [Return C structure by value, 64 bit version]
+-- This function can manipulate DELTA, but it's final value
+-- should be the same as the initial one.
+assign_code64 :: DynFlags
+              -> Maybe CTypeInfo  -- ^ layout of return value
+              -> [LocalReg]       -- ^ destinations
+              -> NatM (OrdList Instr)
+assign_code64 _ _ [] = return nilOL
+assign_code64 dflags Nothing [dest] = assign_code64 dflags (Just ti) [dest]
+  where
+  ti = CPrimType (localRegType dest)
+
+assign_code64 dflags (Just (CPrimType _)) [dest] = return $
+  if isFloatType rep
+    then unitOL $ MOV (floatSize $ typeWidth rep) (OpReg xmm0) (OpReg r_dest)
+    else unitOL $ MOV (cmmTypeSize rep) (OpReg rax) (OpReg r_dest)
+  where
+  platform = targetPlatform dflags
+  rep = localRegType dest
+  r_dest = getRegisterReg platform True (CmmLocal dest)
+
+assign_code64 dflags (Just ctypeinfo) dest_regs = do
+  let max_sz = case platformOS platform of
+                 OSMinGW32 -> 8
+                 _ -> 16
+  if cTypeSize ctypeinfo <= max_sz
+    then assign_from_registers
+    else return assign_from_stack
+  where
+  platform = targetPlatform dflags
+
+  -- The values are returned on stack
+  -- rax contains the address of the area
+  -- The function generates code to assign destination registers
+  -- from stack area.
+  assign_from_stack :: OrdList Instr
+  assign_from_stack =
+    let go _ res _ [] = res
+        go pos res (i@(CPrimType rep):ts) (dest:dests) =
+          let sz = cTypeSize i
+              pad = cTypePadding i pos
+              pos' = pos + pad + sz
+              res' = res `appOL` unitOL
+                (MOV (cmmTypeSize rep)
+                  (OpAddr (AddrBaseIndex (EABaseReg rax) EAIndexNone
+                      (ImmInt $ pos + pad)))
+                  (OpReg r_dest))
+              r_dest = getRegisterReg platform True (CmmLocal dest)
+          in go pos' res' ts dests
+        go pos res (i@(CStruct ts'):ts) dests =
+          let pad = cTypePadding i pos
+              pos' = pos + pad
+          in go pos' res (ts' ++ ts) dests
+        go _ _ _ _ = panic ("genCCall64': mismatch between" ++
+                       " number of destinations and result type")
+    in go 0 nilOL [ctypeinfo] dest_regs
+
+  -- Assign destination registers from rax:rdx or xmm0:xmm1
+  assign_from_registers = do
+    let octets = split_octets ctypeinfo dest_regs
+    (code, _, _) <- foldM assign_octet
+                      (nilOL, [rax, rdx], [xmm0, xmm1]) octets
+    return code
+
+  -- Split destination registers into 8-byte sequences
+  -- taking in account alignment
+  -- Returns list of (abi class, octets)
+  -- Abi class determines how to pass the octet (sse or vanila regs)
+  -- Each octet is a list of (type, register, offset from start of octet)
+  split_octets :: CTypeInfo
+                 -> [LocalReg]
+                 -> [(CAbiClass64, [((CmmType, LocalReg), ByteOff)])]
+  split_octets ctypeinfo dest_regs
+    = go 0 CAbiNoClass [] [ctypeinfo] dest_regs
+    where
+    go _ abiClass res _ [] = [(abiClass, reverse res)]
+    go 8 abiClass res ts dests =
+      (abiClass, reverse res) : go 0 CAbiNoClass [] ts dests
+    go pos abiClass res (i@(CPrimType t) : ts) (dest:dests) =
+      let sz = cTypeSize i
+          pad = cTypePadding i pos
+          newClass = mergeCAbiClasses64 abiClass (cTypeAbiClass64 t)
+      in if pos + pad >= 8
+             then (abiClass, reverse res) :
+                  go 0 (cTypeAbiClass64 t) [] (i:ts) (dest:dests)
+             else go (pos + pad + sz) newClass
+                     (((t, dest), pos + pad) : res) ts dests
+    go pos abiClass res (i@(CStruct ts) : ts') dests =
+        let pad = cTypePadding i pos
+        in go (pos + pad) abiClass res (ts ++ ts') dests
+    go _ _ _ _ _ = panic ("genCCall64': mismatch between" ++
+                         " number of destinations and result type")
+
+  -- assign octet to destination registers
+  assign_octet (result, (reg : intRegs), sseRegs)
+               (CAbiInteger, dest_regs) = do
+    code <- assign_octet' reg dest_regs
+    return (result `appOL` code, intRegs, sseRegs)
+  assign_octet (result, intRegs, (reg : sseRegs)) (CAbiSSE, dest_regs) = do
+    code <- assign_octet' reg dest_regs
+    return (result `appOL` code, intRegs, sseRegs)
+  assign_octet _ _ = panic "genCCall64': impossible in assign_octet"
+
+  -- assign octet from specified register to destination registers
+  assign_octet' reg dest_regs = do
+    move_code <- move_to_stack
+    let code =  go move_code dest_regs
+    cleanup_code <- cleanup
+    return $ code `appOL` cleanup_code
+    where
+    -- push the octet to stack
+    move_to_stack = do
+      delta <- getDeltaNat
+      setDeltaNat (delta - 8)
+      return $ toOL [
+        SUB II64 (OpImm (ImmInt 8)) (OpReg rsp),
+        MOV (intSize $ wordWidth dflags)
+            (OpReg reg)
+            (OpAddr (AddrBaseIndex (EABaseReg rsp)
+                                    EAIndexNone (ImmInt 0))),
+        DELTA (delta - 8)
+        ]
+
+    -- pop the octet out of stack
+    cleanup = do
+      delta <- getDeltaNat
+      setDeltaNat (delta + 8)
+      return $ toOL [
+        ADD II64 (OpImm (ImmInt 8)) (OpReg rsp),
+        DELTA (delta + 8)
+        ]
+
+    -- assign detination registers
+    go res [] = res
+    go res (dest:dests) = go (res `appOL` assign_dest dest) dests
+    assign_dest ((rep, dest), pos) = unitOL $
+        let r_dest = getRegisterReg platform True (CmmLocal dest)
+        in (MOV (cmmTypeSize rep)
+                (OpAddr (AddrBaseIndex (EABaseReg rsp)
+                              EAIndexNone (ImmInt pos)))
+                (OpReg r_dest))
+
+assign_code64 _ _ _ = panic $ "assign_code64: multiple results from ccall " ++
+                              "without type info"
+
+{-
+Note [Return C structure by value, 64 bit version]
+
+Calling convension is pretty complex. But we support only limited number
+of primitive types, it simplifies things for us.
+
+Basically,
+  - if structure size exceedes some limit, it is returned via memory
+  - otherwise it is returned in registers
+  - the limit is 16 bytes on linux/BSD and 8 bytes on windows
+
+When returning via memory, caller should allocate space and pass pointer
+to the allocates area as the first argument. The same pointer will be returned
+from ccall in rax.
+
+When returning via registers, we split the structure into octets.
+For each octet we decide whether sse or regular register should be used,
+see CAbiClass64 and mergeCAbiClasses64.
+
+Specs:
+  - darwin: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/LowLevelABI/000-Introduction/introduction.html
+  - linux/BSD: http://x86-64.org/documentation/abi.pdf
+  - windows: http://msdn.microsoft.com/en-us/library/9b372w95.aspx
+-}
+
 genCCall64' :: DynFlags
             -> ForeignTarget            -- function to call
             -> [CmmFormal]        -- where to put the result
             -> [CmmActual]        -- arguments (of mixed type)
             -> NatM InstrBlock
 genCCall64' dflags target dest_regs args = do
+    let ForeignTarget _ (ForeignConvention _ _ _ _ m_ctypeinfo) = target
+        (result_stack_size, args_used_for_res) =
+          case m_ctypeinfo of
+            Just ti@(CStruct _) ->
+              let sz = cTypeSize ti
+                  max_sz = case platformOS platform of
+                             OSMinGW32 -> 8
+                             _ -> 16
+              in if sz > max_sz
+                   then (sz, 1)
+                   else (0, 0)
+            _ -> (0, 0)
+
+    prepare_res_code <-
+      if result_stack_size == 0 then return nilOL else do
+      -- allocate space for result on stack, store address in
+      -- the first argument register
+      delta <- getDeltaNat
+      setDeltaNat (delta - result_stack_size)
+      let reg = case platformOS platform of
+                  OSMinGW32 -> let ((r,_):_) = allArgRegs platform in r
+                  _ -> let (r:_) = allIntArgRegs platform in r
+      return $ toOL [
+            SUB II64 (OpImm (ImmInt result_stack_size)) (OpReg rsp),
+            MOV II64 (OpReg rsp) (OpReg reg),
+            DELTA (delta - result_stack_size)
+            ]
+
     -- load up the register arguments
     let prom_args = map (maybePromoteCArg dflags W32) args
 
     (stack_args, int_regs_used, fp_regs_used, load_args_code)
          <-
         if platformOS platform == OSMinGW32
-        then load_args_win prom_args [] [] (allArgRegs platform) nilOL
-        else do (stack_args, aregs, fregs, load_args_code)
-                    <- load_args prom_args (allIntArgRegs platform) (allFPArgRegs platform) nilOL
-                let fp_regs_used  = reverse (drop (length fregs) (reverse (allFPArgRegs platform)))
-                    int_regs_used = reverse (drop (length aregs) (reverse (allIntArgRegs platform)))
-                return (stack_args, int_regs_used, fp_regs_used, load_args_code)
+        then do
+            let all_regs = drop args_used_for_res (allArgRegs platform)
+                int_regs_used =
+                  map fst $ take args_used_for_res (allArgRegs platform)
+            load_args_win prom_args int_regs_used [] all_regs nilOL
+        else do
+            let all_int_regs = drop args_used_for_res (allIntArgRegs platform)
+            (stack_args, aregs, fregs, load_args_code)
+                <- load_args prom_args all_int_regs
+                             (allFPArgRegs platform) nilOL
+            let fp_regs_used = reverse (drop (length fregs)
+                                            (reverse (allFPArgRegs platform)))
+                int_regs_used = reverse (drop (length aregs + args_used_for_res)
+                                            (reverse (allIntArgRegs platform)))
+            return (stack_args, int_regs_used, fp_regs_used, load_args_code)
 
     let
         arg_regs_used = int_regs_used ++ fp_regs_used
@@ -2247,7 +2508,7 @@ genCCall64' dflags target dest_regs args = do
     -- alignment of 16n - word_size on procedure entry. Which we
     -- maintain. See Note [rts/StgCRun.c : Stack Alignment on X86]
     (real_size, adjust_rsp) <-
-        if (tot_arg_size + wORD_SIZE dflags) `rem` 16 == 0
+        if (tot_arg_size + result_stack_size + wORD_SIZE dflags) `rem` 16 == 0
             then return (tot_arg_size, nilOL)
             else do -- we need to adjust...
                 delta <- getDeltaNat
@@ -2302,26 +2563,28 @@ genCCall64' dflags target dest_regs args = do
                )
     setDeltaNat (delta + real_size)
 
-    let
-        -- assign the results, if necessary
-        assign_code []     = nilOL
-        assign_code [dest] =
-          case typeWidth rep of
-                W32 | isFloatType rep -> unitOL (MOV (floatSize W32) (OpReg xmm0) (OpReg r_dest))
-                W64 | isFloatType rep -> unitOL (MOV (floatSize W64) (OpReg xmm0) (OpReg r_dest))
-                _ -> unitOL (MOV (cmmTypeSize rep) (OpReg rax) (OpReg r_dest))
-          where
-                rep = localRegType dest
-                r_dest = getRegisterReg platform True (CmmLocal dest)
-        assign_code _many = panic "genCCall.assign_code many"
+    assign_code <- assign_code64 dflags m_ctypeinfo dest_regs
 
-    return (load_args_code      `appOL`
+    cleanup_res_code <-
+      if result_stack_size == 0
+        then return nilOL
+        else do
+          delta <- getDeltaNat
+          setDeltaNat (delta + result_stack_size)
+          return $ toOL [
+            ADD II64 (OpImm (ImmInt result_stack_size)) (OpReg rsp),
+            DELTA (delta + result_stack_size)
+            ]
+
+    return (prepare_res_code    `appOL`
+            load_args_code      `appOL`
             adjust_rsp          `appOL`
             push_code           `appOL`
             lss_code            `appOL`
             assign_eax sse_regs `appOL`
             call                `appOL`
-            assign_code dest_regs)
+            assign_code         `appOL`
+            cleanup_res_code)
 
   where platform = targetPlatform dflags
         arg_size = 8 -- always, at the mo
@@ -2430,7 +2693,8 @@ outOfLineCmmOp mop res args
       dflags <- getDynFlags
       targetExpr <- cmmMakeDynamicReference dflags CallReference lbl
       let target = ForeignTarget targetExpr
-                           (ForeignConvention CCallConv [] [] CmmMayReturn)
+                           (ForeignConvention CCallConv [] []
+                               CmmMayReturn Nothing)
 
       stmtToInstrs (CmmUnsafeForeignCall target (catMaybes [res]) args')
   where

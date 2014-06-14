@@ -153,7 +153,7 @@ pprConvention  Slow                 = text "<slow-convention>"
 pprConvention  GC                   = text "<gc-convention>"
 
 pprForeignConvention :: ForeignConvention -> SDoc
-pprForeignConvention (ForeignConvention c args res ret) =
+pprForeignConvention (ForeignConvention c args res ret _) =
           doubleQuotes (ppr c) <+> text "arg hints: " <+> ppr args <+> text " result hints: " <+> ppr res <+> ppr ret
 
 pprReturnInfo :: CmmReturnInfo -> SDoc

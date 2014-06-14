@@ -203,7 +203,8 @@ emitRtsCallGen res lbl args safe
       if safe then
         emit =<< mkCmmCall fun_expr res' args' updfr_off
       else do
-        let conv = ForeignConvention CCallConv arg_hints res_hints CmmMayReturn
+        let conv = ForeignConvention CCallConv arg_hints res_hints
+                       CmmMayReturn Nothing
         emit $ mkUnsafeCall (ForeignTarget fun_expr conv) res' args'
     (args', arg_hints) = unzip args
     (res',  res_hints) = unzip res

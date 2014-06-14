@@ -1048,14 +1048,16 @@ callSuspendThread :: DynFlags -> LocalReg -> Bool -> CmmNode O O
 callSuspendThread dflags id intrbl =
   CmmUnsafeForeignCall
        (ForeignTarget (foreignLbl (fsLit "suspendThread"))
-        (ForeignConvention CCallConv [AddrHint, NoHint] [AddrHint] CmmMayReturn))
+         (ForeignConvention CCallConv [AddrHint, NoHint] [AddrHint]
+           CmmMayReturn Nothing))
        [id] [CmmReg (CmmGlobal BaseReg), mkIntExpr dflags (fromEnum intrbl)]
 
 callResumeThread :: LocalReg -> LocalReg -> CmmNode O O
 callResumeThread new_base id =
   CmmUnsafeForeignCall
        (ForeignTarget (foreignLbl (fsLit "resumeThread"))
-            (ForeignConvention CCallConv [AddrHint] [AddrHint] CmmMayReturn))
+            (ForeignConvention CCallConv [AddrHint] [AddrHint]
+                CmmMayReturn Nothing))
        [new_base] [CmmReg (CmmLocal id)]
 
 -- -----------------------------------------------------------------------------

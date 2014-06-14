@@ -316,6 +316,7 @@ import Data.Maybe
         'jump'          { L _ (CmmT_jump) }
         'foreign'       { L _ (CmmT_foreign) }
         'never'         { L _ (CmmT_never) }
+        'struct'        { L _ (CmmT_struct) }
         'prim'          { L _ (CmmT_prim) }
         'reserve'       { L _ (CmmT_reserve) }
         'return'        { L _ (CmmT_return) }
@@ -601,8 +602,8 @@ stmt    :: { CmmParse () }
         -- we tweak the syntax to avoid the conflict.  The later
         -- option is taken here because the other way would require
         -- multiple levels of expanding and get unwieldy.
-        | foreign_results 'foreign' STRING foreignLabel '(' cmm_hint_exprs0 ')' safety opt_never_returns ';'
-                {% foreignCall $3 $1 $4 $6 $8 $9 }
+        | foreign_results 'foreign' STRING foreignLabel '(' cmm_hint_exprs0 ')' safety opt_never_returns opt_c_type_info ';'
+                {% foreignCall $3 $1 $4 $6 $8 $9 $10}
         | foreign_results 'prim' '%' NAME '(' exprs0 ')' ';'
                 {% primCall $1 $4 $6 }
         -- stmt-level macros, stealing syntax from ordinary C-- function calls.
@@ -640,6 +641,19 @@ foreignLabel     :: { CmmParse CmmExpr }
 opt_never_returns :: { CmmReturnInfo }
         :                               { CmmMayReturn }
         | 'never' 'returns'             { CmmNeverReturns }
+
+opt_c_type_info :: { Maybe CTypeInfo }
+        :                               { Nothing }
+        | c_type_info                   { Just $1}
+
+c_type_info :: { CTypeInfo }
+        : type                          { CPrimType $1 }
+        | 'struct' '(' c_type_infos ')' { CStruct $3 }
+
+c_type_infos :: { [CTypeInfo] }
+        :                               { [] }
+        | c_type_info                   { [$1] }
+        | c_type_info ',' c_type_infos  { $1 : $3 }
 
 bool_expr :: { CmmParse BoolExpr }
         : bool_op                       { $1 }
@@ -1116,8 +1130,9 @@ foreignCall
         -> [CmmParse (CmmExpr, ForeignHint)]
         -> Safety
         -> CmmReturnInfo
+        -> Maybe CTypeInfo
         -> P (CmmParse ())
-foreignCall conv_string results_code expr_code args_code safety ret
+foreignCall conv_string results_code expr_code args_code safety ret ctype
   = do  conv <- case conv_string of
           "C" -> return CCallConv
           "stdcall" -> return StdCallConv
@@ -1131,7 +1146,7 @@ foreignCall conv_string results_code expr_code args_code safety ret
                   expr' = adjCallTarget dflags conv expr args
                   (arg_exprs, arg_hints) = unzip args
                   (res_regs,  res_hints) = unzip results
-                  fc = ForeignConvention conv arg_hints res_hints ret
+                  fc = ForeignConvention conv arg_hints res_hints ret ctype
                   target = ForeignTarget expr' fc
           _ <- code $ emitForeignCall safety res_regs target arg_exprs
           return ()
