@@ -151,6 +151,7 @@ data CmmToken
   | CmmT_jump
   | CmmT_foreign
   | CmmT_never
+  | CmmT_struct
   | CmmT_prim
   | CmmT_reserve
   | CmmT_return
@@ -234,6 +235,7 @@ reservedWordsFM = listToUFM $
         ( "jump",               CmmT_jump ),
         ( "foreign",            CmmT_foreign ),
         ( "never",              CmmT_never ),
+        ( "struct",             CmmT_struct ),
         ( "prim",               CmmT_prim ),
         ( "reserve",            CmmT_reserve ),
         ( "return",             CmmT_return ),

@@ -13,7 +13,7 @@ module CmmNode (
      CmmNode(..), CmmFormal, CmmActual, CmmTickish,
      UpdFrameOffset, Convention(..),
      ForeignConvention(..), ForeignTarget(..), foreignTargetHints,
-     CmmReturnInfo(..),
+     CmmReturnInfo(..), CTypeInfo(..),
      mapExp, mapExpDeep, wrapRecExp, foldExp, foldExpDeep, wrapRecExpf,
      mapExpM, mapExpDeepM, wrapRecExpM, mapSuccessors,
 
@@ -276,7 +276,18 @@ data ForeignConvention
         [ForeignHint]           -- Extra info about the args
         [ForeignHint]           -- Extra info about the result
         CmmReturnInfo
+        (Maybe CTypeInfo)       -- Return value layout
   deriving Eq
+
+-- | Layout of C type
+data CTypeInfo
+  = CPrimType CmmType
+  | CStruct [CTypeInfo]
+
+instance Eq CTypeInfo where
+  CPrimType t1 == CPrimType t2 = cmmEqType t1 t2
+  CStruct ts1 == CStruct ts2 = ts1 == ts2
+  _ == _ = False
 
 data CmmReturnInfo
   = CmmMayReturn
@@ -299,7 +310,7 @@ foreignTargetHints target
     (res_hints, arg_hints) =
        case target of
           PrimTarget op -> callishMachOpHints op
-          ForeignTarget _ (ForeignConvention _ arg_hints res_hints _) ->
+          ForeignTarget _ (ForeignConvention _ arg_hints res_hints _ _) ->
              (res_hints, arg_hints)
 
 --------------------------------------------------
@@ -369,7 +380,8 @@ instance DefinerOfRegs GlobalReg (CmmNode e x) where
           activeRegs = activeStgRegs platform
           activeCallerSavesRegs = filter (callerSaves platform) activeRegs
 
-          foreignTargetRegs (ForeignTarget _ (ForeignConvention _ _ _ CmmNeverReturns)) = []
+          foreignTargetRegs (ForeignTarget _
+              (ForeignConvention _ _ _ CmmNeverReturns _)) = []
           foreignTargetRegs _ = activeCallerSavesRegs
 
 -- Note [Safe foreign calls clobber STG registers]

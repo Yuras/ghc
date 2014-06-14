@@ -390,7 +390,7 @@ genCall target res args = runStmtsDecls $ do
     -- extract Cmm call convention, and translate to LLVM call convention
     platform <- lift $ getLlvmPlatform
     let lmconv = case target of
-            ForeignTarget _ (ForeignConvention conv _ _ _) ->
+            ForeignTarget _ (ForeignConvention conv _ _ _ _) ->
               case conv of
                  StdCallConv  -> case platformArch platform of
                                  ArchX86    -> CC_X86_Stdcc
@@ -416,7 +416,7 @@ genCall target res args = runStmtsDecls $ do
                 | otherwise     = llvmStdFunAttrs
 
         never_returns = case target of
-             ForeignTarget _ (ForeignConvention _ _ _ CmmNeverReturns) -> True
+             ForeignTarget _ (ForeignConvention _ _ _ CmmNeverReturns _) -> True
              _ -> False
 
     -- fun type

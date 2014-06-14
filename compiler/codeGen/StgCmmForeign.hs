@@ -91,7 +91,8 @@ cgForeignCall (CCall (CCallSpec target cconv safety)) stg_args res_ty
                    DynamicTarget    ->  case cmm_args of
                                            (fn,_):rest -> (unzip rest, fn)
                                            [] -> panic "cgForeignCall []"
-              fc = ForeignConvention cconv arg_hints res_hints CmmMayReturn
+              fc = ForeignConvention cconv arg_hints res_hints
+                       CmmMayReturn Nothing
               call_target = ForeignTarget cmm_target fc
 
         -- we want to emit code for the call, and then emitReturn.
@@ -192,7 +193,7 @@ emitCCall hinted_results fn hinted_args
     (args, arg_hints) = unzip hinted_args
     (results, result_hints) = unzip hinted_results
     target = ForeignTarget fn fc
-    fc = ForeignConvention CCallConv arg_hints result_hints CmmMayReturn
+    fc = ForeignConvention CCallConv arg_hints result_hints CmmMayReturn Nothing
 
 
 emitPrimCall :: [CmmFormal] -> CallishMachOp -> [CmmActual] -> FCode ()
