@@ -1,0 +1,12 @@
+
+#include "Cmm.h"
+
+#define S struct(CInt, W_)
+
+cmm_test(W_ i)
+{
+	CInt i1;
+        W_ p;
+	(i1, p) = ccall c_test(W_TO_INT(i)) S;
+	return (TO_W_(i1), p);
+}
