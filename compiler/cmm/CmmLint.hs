@@ -19,6 +19,7 @@ import BlockId
 import FastString
 import Outputable
 import DynFlags
+import ForeignCall
 
 import Data.Maybe
 import Control.Monad (liftM, ap)
@@ -154,8 +155,9 @@ lintCmmMiddle node = case node of
             _ <- lintCmmExpr r
             return ()
 
-  CmmUnsafeForeignCall target _formals actuals -> do
+  CmmUnsafeForeignCall target formals actuals -> do
             lintTarget target
+            lintForeignFormals target formals
             mapM_ lintCmmExpr actuals
 
 
@@ -182,8 +184,9 @@ lintCmmLast labels node = case node of
           _ <- lintCmmExpr target
           maybe (return ()) checkTarget cont
 
-  CmmForeignCall tgt _ args succ _ _ _ -> do
+  CmmForeignCall tgt formals args succ _ _ _ -> do
           lintTarget tgt
+          lintForeignFormals tgt formals
           mapM_ lintCmmExpr args
           checkTarget succ
  where
@@ -193,8 +196,48 @@ lintCmmLast labels node = case node of
 
 
 lintTarget :: ForeignTarget -> CmmLint ()
-lintTarget (ForeignTarget e _) = lintCmmExpr e >> return ()
+lintTarget (ForeignTarget e conv) = lintCmmExpr e >> lintForeignConvention conv
 lintTarget (PrimTarget {})     = return ()
+
+
+lintForeignConvention :: ForeignConvention -> CmmLint ()
+lintForeignConvention (ForeignConvention conv _ _ _ (Just (CStruct _)))
+  | conv /= CCallConv
+  = cmmLintErr (text "only the ccall convention supports C structures")
+lintForeignConvention _ = return ()
+
+
+lintForeignFormals :: ForeignTarget -> [CmmFormal] -> CmmLint ()
+lintForeignFormals
+  (ForeignTarget _ (ForeignConvention _ _ _ _ mtypeinfo)) formals
+  | Nothing <- mtypeinfo,
+    (_:_:_) <- formals
+  = cmmLintErr (text "multiple return values without C type annotation")
+  | Just ctypeinfo <- mtypeinfo
+  = checkFormals [ctypeinfo] formals
+  | otherwise
+  = return ()
+lintForeignFormals (PrimTarget {}) _ = return ()
+
+
+checkFormals :: [CTypeInfo] -> [CmmFormal] -> CmmLint ()
+checkFormals [] [] = return ()
+checkFormals (CPrimType t:ts) (f:fs)
+  | not (isFloatType t) && not (isFloatType $ localRegType f)
+  -- we allow integral types to have different width
+  -- because is some cases (e.g. safe call), we pass params
+  -- via global registerns
+  = checkFormals ts fs
+  | otherwise
+  = if cmmEqType t (localRegType f)
+      then checkFormals ts fs
+      else cmmLintErr
+            ((text "type of formal doesn't correspond to C type annotation") $$
+             (text "expected" <+> ppr t <+> text "but found"  <+> (ppr f)))
+checkFormals (CStruct ts : ts') (fs) = do
+  checkFormals (ts ++ ts') fs
+checkFormals _ _ =
+  cmmLintErr (text "missmatch between number of formals and C type annotation")
 
 
 checkCond :: DynFlags -> CmmExpr -> CmmLint ()
