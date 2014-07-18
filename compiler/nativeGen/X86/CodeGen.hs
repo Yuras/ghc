@@ -2077,13 +2077,18 @@ genCCall32' dflags target dest_regs args = do
             raw_arg_size        = sum sizes + wORD_SIZE dflags
             arg_pad_size        = (roundTo 16 $ raw_arg_size) - raw_arg_size
             tot_arg_size        = raw_arg_size + arg_pad_size - wORD_SIZE dflags
-        delta0 <- getDeltaNat
-        setDeltaNat (delta0 - arg_pad_size)
+
+        arg_pad_code <- do
+            delta <- getDeltaNat
+            setDeltaNat (delta - arg_pad_size)
+            if arg_pad_size == 0
+                then return nilOL
+                else return $ toOL [
+                         SUB II32 (OpImm (ImmInt arg_pad_size)) (OpReg esp),
+                         DELTA (delta - arg_pad_size)]
 
         use_sse2 <- sse2Enabled
         push_codes <- mapM (push_arg use_sse2) (reverse prom_args)
-        delta <- getDeltaNat
-        MASSERT(delta == delta0 - tot_arg_size)
 
         -- deal with static vs dynamic call targets
         (callinsns,cconv) <-
@@ -2100,13 +2105,7 @@ genCCall32' dflags target dest_regs args = do
                 -> panic $ "genCCall: Can't handle PrimTarget call type here, error "
                             ++ "probably because too many return values."
 
-        let push_code
-                | arg_pad_size /= 0
-                = toOL [SUB II32 (OpImm (ImmInt arg_pad_size)) (OpReg esp),
-                        DELTA (delta0 - arg_pad_size)]
-                  `appOL` concatOL push_codes
-                | otherwise
-                = concatOL push_codes
+        let push_code = arg_pad_code `appOL` concatOL push_codes
 
               -- Deallocate parameters after call for ccall;
               -- but not for stdcall (callee does it)
@@ -2117,49 +2116,53 @@ genCCall32' dflags target dest_regs args = do
                | ForeignConvention StdCallConv _ _ _ _ <- cconv = arg_pad_size
                | otherwise = tot_arg_size
 
-            call = callinsns `appOL`
-                   toOL (
-                      (if pop_size==0 then [] else
-                       [ADD II32 (OpImm (ImmInt pop_size)) (OpReg esp)])
-                      ++
-                      [DELTA delta0]
-                   )
-        setDeltaNat delta0
+        call <- do
+            delta <- getDeltaNat
+            setDeltaNat (delta + tot_arg_size)
+            if pop_size == 0
+                then return callinsns
+                else return $ callinsns `appOL` toOL [
+                    ADD II32 (OpImm (ImmInt pop_size)) (OpReg esp),
+                    DELTA (delta + tot_arg_size)]
 
         dflags <- getDynFlags
         let platform = targetPlatform dflags
 
-        let
-            -- assign the results, if necessary
-            assign_code []     = nilOL
-            assign_code [dest]
-              | isFloatType ty =
-                 if use_sse2
-                    then let tmp_amode = AddrBaseIndex (EABaseReg esp)
-                                                       EAIndexNone
-                                                       (ImmInt 0)
-                             sz = floatSize w
-                         in toOL [ SUB II32 (OpImm (ImmInt b)) (OpReg esp),
-                                   DELTA (delta0 - b),
-                                   GST sz fake0 tmp_amode,
-                                   MOV sz (OpAddr tmp_amode) (OpReg r_dest),
-                                   ADD II32 (OpImm (ImmInt b)) (OpReg esp),
-                                   DELTA delta0]
-                    else unitOL (GMOV fake0 r_dest)
-              | isWord64 ty    = toOL [MOV II32 (OpReg eax) (OpReg r_dest),
-                                        MOV II32 (OpReg edx) (OpReg r_dest_hi)]
-              | otherwise      = unitOL (MOV (intSize w) (OpReg eax) (OpReg r_dest))
-              where
-                    ty = localRegType dest
-                    w  = typeWidth ty
-                    b  = widthInBytes w
-                    r_dest_hi = getHiVRegFromLo r_dest
-                    r_dest    = getRegisterReg platform use_sse2 (CmmLocal dest)
-            assign_code many = pprPanic "genCCall.assign_code - too many return values:" (ppr many)
+        assign_code <-
+            case dest_regs of
+                [] -> return nilOL
+                [dest] -> do
+                    let ty = localRegType dest
+                        w  = typeWidth ty
+                        b  = widthInBytes w
+                        r_dest_hi = getHiVRegFromLo r_dest
+                        r_dest    = getRegisterReg platform use_sse2 (CmmLocal dest)
+                    if isFloatType ty
+                        then
+                            if use_sse2
+                                then do
+                                    let tmp_amode = AddrBaseIndex (EABaseReg esp)
+                                                                   EAIndexNone
+                                                                  (ImmInt 0)
+                                        sz = floatSize w
+                                    delta <- getDeltaNat
+                                    return $ toOL [
+                                        SUB II32 (OpImm (ImmInt b)) (OpReg esp),
+                                        DELTA (delta - b),
+                                        GST sz fake0 tmp_amode,
+                                        MOV sz (OpAddr tmp_amode) (OpReg r_dest),
+                                        ADD II32 (OpImm (ImmInt b)) (OpReg esp),
+                                        DELTA delta]
+                    else return $ unitOL (GMOV fake0 r_dest)
+                        else if isWord64 ty
+                                 then return $ toOL [MOV II32 (OpReg eax) (OpReg r_dest),
+                                              MOV II32 (OpReg edx) (OpReg r_dest_hi)]
+                                 else return $ unitOL (MOV (intSize w) (OpReg eax) (OpReg r_dest))
+                _ -> pprPanic "genCCall.assign_code - too many return values:" (ppr dest_regs)
 
         return (push_code `appOL`
                 call `appOL`
-                assign_code dest_regs)
+                assign_code)
 
       where
         arg_size :: CmmType -> Int  -- Width in bytes
