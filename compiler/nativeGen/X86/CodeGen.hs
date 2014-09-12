@@ -2061,6 +2061,206 @@ genCCall _ is32Bit target dest_regs args = do
         addSubIntC _ _ _ _ _ _ _
             = panic "genCCall: Wrong number of arguments/results for addSubIntC"
 
+-- | Assign return value of foreign call to destination registers
+--
+-- See Note [Return C structure by value, 32 bit version]
+-- This function can manipulate DELTA, but it's final value
+-- should be the same as the initial one.
+assign_code32 :: DynFlags
+              -> Maybe CTypeInfo  -- ^ layout of return value
+              -> [LocalReg]       -- ^ destinations
+              -> NatM (OrdList Instr)
+assign_code32 _ _ [] = return nilOL
+
+-- One destination and no type annotation, e.g. manually written cmm
+-- Default it to prim type of the register
+assign_code32 dflags Nothing [dest] = assign_code32 dflags (Just ti) [dest]
+  where
+  ti = CPrimType (localRegType dest)
+
+assign_code32 dflags (Just (CPrimType _)) [dest] = do
+  use_sse2 <- sse2Enabled
+  let platform = targetPlatform dflags
+      ty = localRegType dest
+      w  = typeWidth ty
+      b  = widthInBytes w
+      r_dest_hi = getHiVRegFromLo r_dest
+      r_dest    = getRegisterReg platform use_sse2 (CmmLocal dest)
+  if isFloatType ty
+      then
+          if use_sse2
+              then do
+                  let tmp_amode = AddrBaseIndex (EABaseReg esp)
+                                                 EAIndexNone
+                                                (ImmInt 0)
+                      sz = floatSize w
+                  delta <- getDeltaNat
+                  return $ toOL [
+                      SUB II32 (OpImm (ImmInt b)) (OpReg esp),
+                      DELTA (delta - b),
+                      GST sz fake0 tmp_amode,
+                      MOV sz (OpAddr tmp_amode) (OpReg r_dest),
+                      ADD II32 (OpImm (ImmInt b)) (OpReg esp),
+                      DELTA delta]
+              else return $ unitOL (GMOV fake0 r_dest)
+      else if isWord64 ty
+               then return $ toOL [
+                  MOV II32 (OpReg eax) (OpReg r_dest),
+                  MOV II32 (OpReg edx) (OpReg r_dest_hi)]
+               else return $ unitOL
+                  (MOV (intSize w) (OpReg eax) (OpReg r_dest))
+
+assign_code32 dflags (Just ctypeinfo@(CStruct _)) dest_regs = do
+  let total_sz = cTypeSize ctypeinfo
+      max_sz = case platformOS platform of
+                 OSMinGW32 -> 8
+                 OSDarwin -> 8
+                 _ -> 0
+  if total_sz > max_sz
+    then assign_from_stack
+    else assign_from_registers
+  where
+  platform = targetPlatform dflags
+
+  -- The values is returned on stack
+  -- eax contains the address of the area
+  -- The function generates code to assign destination registers
+  -- from stack area.
+  assign_from_stack :: NatM (OrdList Instr)
+  assign_from_stack = do
+    use_sse2 <- sse2Enabled
+    let -- Fold the annotations and destination registers
+        -- and produce the code to assign the registers
+        go :: Int             -- current position in the area
+           -> OrdList Instr   -- the code generated so far
+           -> [CTypeInfo]     -- annotations for not-yet-assigned part
+           -> [LocalReg]      -- not yet assigned destination registers
+           -> OrdList Instr   -- generated code
+        go _ res _ [] = res
+        go pos res (i@(CPrimType rep) : ts) (dest:dests) =
+          let sz = cTypeSize i
+              pad = cTypePadding i pos
+              pos' = pos + pad + sz
+              ty = localRegType dest
+              r_dest_hi = getHiVRegFromLo r_dest
+              r_dest = getRegisterReg platform use_sse2 (CmmLocal dest)
+              addr = AddrBaseIndex (EABaseReg eax) EAIndexNone
+                (ImmInt (pos + pad))
+              addr_lw = AddrBaseIndex (EABaseReg eax) EAIndexNone
+                (ImmInt (pos + pad - wORD_SIZE dflags))
+              code =
+                if isFloatType ty && not use_sse2
+                  then unitOL (GLD (cmmTypeSize rep) addr r_dest)
+                  else if isWord64 ty
+                         then toOL [
+                           MOV II32 (OpAddr addr) (OpReg r_dest_hi),
+                           MOV II32 (OpAddr addr_lw) (OpReg r_dest)
+                           ]
+                         else unitOL (MOV (cmmTypeSize rep)
+                                      (OpAddr addr)
+                                      (OpReg r_dest))
+          in go pos' (res `appOL` code) ts dests
+        go pos res (i@(CStruct ts') : ts) dests =
+          let pad = cTypePadding i pos
+              pos' = pos + pad
+          in go pos' res (ts' ++ ts) dests
+        go _ _ _ _ = panic ("genCCall32': mistmatch between " ++
+                            "number of destinations and result type")
+    return $ go 0 nilOL [ctypeinfo] dest_regs
+
+  -- Assign destination registers frim eax:edx
+  assign_from_registers = do
+    let quartets = split_quartets ctypeinfo dest_regs
+    (code, _) <- foldM assign_quartet (nilOL, [eax, edx]) quartets
+    return code
+
+  -- Split destination registers into 4-byte sequences
+  -- taking in account alignment
+  -- Returns list of quartets
+  -- Each quartet is a list of (type, register, offset from start of quartet)
+  split_quartets :: CTypeInfo
+                 -> [LocalReg]
+                 -> [[((CmmType, LocalReg), ByteOff)]]
+  split_quartets ctypeinfo dest_regs =
+    go 0 [] [ctypeinfo] dest_regs
+    where
+    go _ res _ [] = [reverse res]
+    go 4 res ts dests =
+      reverse res : go 0 [] ts dests
+    go pos res (i@(CPrimType t) : ts) (dest:dests) =
+      let sz = cTypeSize i
+          pad = cTypePadding i pos
+      in if pos + pad >= 4
+           then reverse res : go 0 [] (i:ts) (dest:dests)
+           else go (pos + pad + sz) (((t, dest), pos + pad) : res) ts dests
+    go pos res (i@(CStruct ts) : ts') dests =
+      let pad = cTypePadding i pos
+      in go (pos + pad) res (ts ++ ts') dests
+    go _ _ _ _ = panic ("genCCall32': mistmatch between " ++
+                        "number of destinations and result type")
+
+  -- assign quartet to destination registers
+  assign_quartet (result, (reg:regs)) dest_regs = do
+    use_sse2 <- sse2Enabled
+    move_code <- move_to_stack
+    code <- go move_code use_sse2 dest_regs
+    cleanup_code <- cleanup
+    return (result `appOL` code `appOL` cleanup_code, regs)
+    where
+    -- push the quartet to stack
+    move_to_stack = do
+      delta <- getDeltaNat
+      setDeltaNat (delta - 4)
+      return $ toOL [
+        SUB II32 (OpImm (ImmInt 4)) (OpReg esp),
+        MOV II32 (OpReg reg)
+            (OpAddr (AddrBaseIndex (EABaseReg esp)
+                                    EAIndexNone (ImmInt 0))),
+        DELTA (delta - 4)
+        ]
+
+    -- pop the quarter out of stack
+    cleanup = do
+      delta <- getDeltaNat
+      setDeltaNat (delta + 4)
+      return $ toOL [
+        ADD II32 (OpImm (ImmInt 4)) (OpReg esp),
+        DELTA (delta + 4)
+        ]
+
+    -- for each register, assign it from stack at offset
+    go res _ [] = return res
+    go res use_sse2 (dest:dests) =
+      go (res `appOL` assign_dest use_sse2 dest) use_sse2 dests
+    assign_dest use_sse2 ((rep, dest), pos) = unitOL $
+      let r_dest = getRegisterReg platform use_sse2 (CmmLocal dest)
+          ty = localRegType dest
+          addr = AddrBaseIndex (EABaseReg esp)
+                                EAIndexNone (ImmInt pos)
+      in if isFloatType ty && not use_sse2
+           then GLD (cmmTypeSize rep) addr r_dest
+           else MOV (cmmTypeSize rep) (OpAddr addr) (OpReg r_dest)
+  assign_quartet _ _ = panic "genCCal32': impossible in assign_quartet"
+
+assign_code32 _ _ dest_regs =
+  pprPanic "genCCall.assign_code - too many return values:" (ppr dest_regs)
+
+{-
+Note [Return C structure by value, 32 bit version]
+
+On linux structures are always returned in memory.
+
+On windows and darwin structures up to 8 byte wide are returned in edx:eax
+
+When passing in memory, caller allocates area for return value
+and passes the pointer as the first argument. Callee pops the pointer.
+
+Specs:
+  - darwin: https://developer.apple.com/library/mac/documentation/DeveloperTools/Conceptual/LowLevelABI/000-Introduction/introduction.html
+  - linux: http://web.stanford.edu/class/cs140/projects/pintos/specs/sysv-abi-i386-4.pdf
+  - windows: http://msdn.microsoft.com/en-us/library/k2b2ssfy.aspx
+-}
+
 genCCall32' :: DynFlags
             -> ForeignTarget            -- function to call
             -> [CmmFormal]        -- where to put the result
@@ -2068,15 +2268,45 @@ genCCall32' :: DynFlags
             -> NatM InstrBlock
 genCCall32' dflags target dest_regs args = do
         let
+            platform = targetPlatform dflags
+            ForeignTarget _ (ForeignConvention _ _ _ _ m_ctypeinfo) = target
+            (result_stack_size, result_arg_size) =
+              case m_ctypeinfo of
+                Just ti@(CStruct _) ->
+                  let sz = cTypeSize ti
+                      max_sz = case platformOS platform of
+                                 OSMinGW32 -> 8
+                                 OSDarwin -> 8
+                                 _ -> 0
+                  in if sz > max_sz
+                       then (sz, wORD_SIZE dflags)
+                       else (0, 0)
+                _ -> (0, 0)
             prom_args = map (maybePromoteCArg dflags W32) args
 
             -- Align stack to 16n for calls, assuming a starting stack
             -- alignment of 16n - word_size on procedure entry. Which we
             -- maintiain. See Note [rts/StgCRun.c : Stack Alignment on X86]
-            sizes               = map (arg_size . cmmExprType dflags) (reverse args)
-            raw_arg_size        = sum sizes + wORD_SIZE dflags
-            arg_pad_size        = (roundTo 16 $ raw_arg_size) - raw_arg_size
-            tot_arg_size        = raw_arg_size + arg_pad_size - wORD_SIZE dflags
+            sizes        = map (arg_size . cmmExprType dflags) (reverse args)
+            raw_arg_size = sum sizes + result_arg_size + wORD_SIZE dflags
+            arg_pad_size = (roundTo 16 $ raw_arg_size + result_stack_size)
+                         - raw_arg_size - result_stack_size
+            tot_arg_size = raw_arg_size + arg_pad_size - wORD_SIZE dflags
+
+        (prepare_res_code, result_tmp_reg) <-
+          -- allocate space for result on stack, store address in tmp reg
+          if result_stack_size == 0
+              then return (nilOL, Nothing)
+              else do
+                reg <- getNewRegNat II32
+                delta <- getDeltaNat
+                setDeltaNat (delta - result_stack_size)
+                let code = toOL [
+                      SUB II32 (OpImm (ImmInt result_stack_size)) (OpReg esp),
+                      DELTA (delta - result_stack_size),
+                      MOV II32 (OpReg esp) (OpReg reg)
+                      ]
+                return (code, Just reg)
 
         arg_pad_code <- do
             delta <- getDeltaNat
@@ -2089,6 +2319,17 @@ genCCall32' dflags target dest_regs args = do
 
         use_sse2 <- sse2Enabled
         push_codes <- mapM (push_arg use_sse2) (reverse prom_args)
+
+        push_result_code <-
+          case result_tmp_reg of
+            Nothing -> return nilOL
+            Just reg -> do
+              delta <- getDeltaNat
+              setDeltaNat (delta - result_arg_size)
+              return $ toOL [
+                PUSH II32 (OpReg reg),
+                DELTA (delta - result_arg_size)
+                ]
 
         -- deal with static vs dynamic call targets
         (callinsns,cconv) <-
@@ -2105,7 +2346,9 @@ genCCall32' dflags target dest_regs args = do
                 -> panic $ "genCCall: Can't handle PrimTarget call type here, error "
                             ++ "probably because too many return values."
 
-        let push_code = arg_pad_code `appOL` concatOL push_codes
+        let push_code = arg_pad_code `appOL`
+                        concatOL push_codes `appOL`
+                        push_result_code
 
               -- Deallocate parameters after call for ccall;
               -- but not for stdcall (callee does it)
@@ -2114,55 +2357,38 @@ genCCall32' dflags target dest_regs args = do
               -- even if we are doing stdcall, though (#5052)
             pop_size
                | ForeignConvention StdCallConv _ _ _ _ <- cconv = arg_pad_size
-               | otherwise = tot_arg_size
+               -- Callee pops result structure pointer itself
+               | otherwise = tot_arg_size - result_arg_size
 
         call <- do
             delta <- getDeltaNat
             setDeltaNat (delta + tot_arg_size)
             if pop_size == 0
-                then return callinsns
+                then return $ callinsns `appOL`
+                    unitOL (DELTA (delta + tot_arg_size))
                 else return $ callinsns `appOL` toOL [
                     ADD II32 (OpImm (ImmInt pop_size)) (OpReg esp),
                     DELTA (delta + tot_arg_size)]
 
         dflags <- getDynFlags
-        let platform = targetPlatform dflags
+        assign_code <- assign_code32 dflags m_ctypeinfo dest_regs
 
-        assign_code <-
-            case dest_regs of
-                [] -> return nilOL
-                [dest] -> do
-                    let ty = localRegType dest
-                        w  = typeWidth ty
-                        b  = widthInBytes w
-                        r_dest_hi = getHiVRegFromLo r_dest
-                        r_dest    = getRegisterReg platform use_sse2 (CmmLocal dest)
-                    if isFloatType ty
-                        then
-                            if use_sse2
-                                then do
-                                    let tmp_amode = AddrBaseIndex (EABaseReg esp)
-                                                                   EAIndexNone
-                                                                  (ImmInt 0)
-                                        sz = floatSize w
-                                    delta <- getDeltaNat
-                                    return $ toOL [
-                                        SUB II32 (OpImm (ImmInt b)) (OpReg esp),
-                                        DELTA (delta - b),
-                                        GST sz fake0 tmp_amode,
-                                        MOV sz (OpAddr tmp_amode) (OpReg r_dest),
-                                        ADD II32 (OpImm (ImmInt b)) (OpReg esp),
-                                        DELTA delta]
-                    else return $ unitOL (GMOV fake0 r_dest)
-                        else if isWord64 ty
-                                 then return $ toOL [MOV II32 (OpReg eax) (OpReg r_dest),
-                                              MOV II32 (OpReg edx) (OpReg r_dest_hi)]
-                                 else return $ unitOL (MOV (intSize w) (OpReg eax) (OpReg r_dest))
-                _ -> pprPanic "genCCall.assign_code - too many return values:" (ppr dest_regs)
+        cleanup_res_code <-
+          if result_stack_size == 0
+            then return nilOL
+            else do
+              delta <- getDeltaNat
+              setDeltaNat (delta + result_stack_size)
+              return $ toOL [
+                ADD II32 (OpImm (ImmInt result_stack_size)) (OpReg esp),
+                DELTA (delta + result_stack_size)
+                ]
 
-        return (push_code `appOL`
+        return (prepare_res_code `appOL`
+                push_code `appOL`
                 call `appOL`
-                assign_code)
+                assign_code `appOL`
+                cleanup_res_code)
 
       where
         arg_size :: CmmType -> Int  -- Width in bytes
