@@ -1,0 +1,13 @@
+
+#include "Cmm.h"
+
+#define CChar I8
+
+#define S struct(CChar, F_)
+
+cmm_test(W_ i) {
+    CChar c;
+    F_ f;
+    (c, f) = ccall c_test(W_TO_INT(i)) S;
+    return (TO_W_(c), f);
+}

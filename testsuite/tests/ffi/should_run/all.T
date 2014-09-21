@@ -209,3 +209,27 @@ test('T8083',
      compile_and_run,
      ['T8083_c.c'])
 
+test('cmm_cstruct001',
+     [omit_ways(['ghci']), extra_clean(['cmm_cstruct001_c.o', 'cmm_cstruct001_cmm.o'])],
+     compile_and_run, ['cmm_cstruct001_c.c cmm_cstruct001_cmm.cmm'])
+
+test('cmm_cstruct002',
+     [expect_fail_for('optllvm'), omit_ways(['ghci']), extra_clean(['cmm_cstruct002_c.o', 'cmm_cstruct002_cmm.o'])],
+     compile_and_run, ['cmm_cstruct002_c.c cmm_cstruct002_cmm.cmm'])
+
+test('cmm_cstruct003',
+     [expect_fail_for('optllvm'), omit_ways(['ghci']), extra_clean(['cmm_cstruct003_c.o', 'cmm_cstruct003_cmm.o'])],
+     compile_and_run, ['cmm_cstruct003_c.c cmm_cstruct003_cmm.cmm'])
+
+test('cmm_cstruct004',
+     [expect_fail_for('optllvm'), omit_ways(['ghci']), extra_clean(['cmm_cstruct004_c.o', 'cmm_cstruct004_cmm.o'])],
+     compile_and_run, ['cmm_cstruct004_c.c cmm_cstruct004_cmm.cmm'])
+
+test('cmm_cstruct005',
+     [expect_fail_for('optllvm'), omit_ways(['ghci']), extra_clean(['cmm_cstruct005_c.o', 'cmm_cstruct005_cmm.o'])],
+     compile_and_run, ['cmm_cstruct005_c.c cmm_cstruct005_cmm.cmm'])
+
+test('cmm_cstruct006',
+     [expect_fail_for('optllvm'), omit_ways(['ghci']), extra_clean(['cmm_cstruct006_c.o', 'cmm_cstruct006_cmm.o'])],
+     compile_and_run, ['cmm_cstruct006_c.c cmm_cstruct006_cmm.cmm'])
+

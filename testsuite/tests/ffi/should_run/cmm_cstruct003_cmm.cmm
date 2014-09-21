@@ -1,0 +1,10 @@
+
+#include "Cmm.h"
+
+#define S struct(CInt, CInt, CInt, CInt, CInt)
+
+cmm_test(W_ i) {
+    CInt i1, i2, i3, i4, i5;
+    (i1, i2, i3, i4, i5) = ccall c_test(W_TO_INT(i)) S;
+    return (TO_W_(i1), TO_W_(i2), TO_W_(i3), TO_W_(i4), TO_W_(i5));
+}
