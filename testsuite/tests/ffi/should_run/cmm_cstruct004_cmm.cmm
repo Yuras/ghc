@@ -1,0 +1,17 @@
+
+#include "Cmm.h"
+
+#define CChar I8
+#define CPtr W_
+#define CFloat F_
+#define CDouble D_
+
+#define S struct(CChar, CFloat, CDouble)
+
+cmm_test(W_ i) {
+    CChar c;
+    CFloat f;
+    CDouble d;
+    (c, f, d) = ccall c_test(W_TO_INT(i)) S;
+    return (TO_W_(c), f, d);
+}
