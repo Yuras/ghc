@@ -479,6 +479,7 @@ Library
         UniqFM
         UniqSet
         Util
+        MiniStg
         Vectorise.Builtins.Base
         Vectorise.Builtins.Initialise
         Vectorise.Builtins

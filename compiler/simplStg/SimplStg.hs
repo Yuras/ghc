@@ -26,6 +26,8 @@ import UniqSupply       ( mkSplitUniqSupply, splitUniqSupply )
 import Outputable
 import Control.Monad
 
+import qualified MiniStg
+
 stg2stg :: DynFlags                  -- includes spec of what stg-to-stg passes to do
         -> Module                    -- module name (profiling only)
         -> [StgBinding]              -- input...
@@ -50,6 +52,9 @@ stg2stg dflags module_name binds
 
         ; dumpIfSet_dyn dflags Opt_D_dump_stg "STG syntax:"
                         (pprStgBindings un_binds)
+
+        ; dumpIfSet_dyn dflags Opt_D_dump_ministg "miniSTG syntax:"
+                        (MiniStg.pprMiniStgBindings un_binds)
 
         ; return (un_binds, cost_centres)
    }
